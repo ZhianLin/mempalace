@@ -1,8 +1,12 @@
 """Tests for mempalace.project_scanner."""
 
 import json
+import os
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from mempalace.project_scanner import (
     PersonInfo,
@@ -10,6 +14,7 @@ from mempalace.project_scanner import (
     _dedupe_people,
     _is_bot,
     _looks_like_real_name,
+    _collect_manifest_names,
     _merge_detected,
     _parse_cargo,
     _parse_gomod,
@@ -184,15 +189,24 @@ def test_find_git_repos_detects_nested(tmp_path):
 
 
 def test_find_git_repos_skips_nested_inside_repo(tmp_path):
-    """If root is a repo and there's another repo inside it, the inner repo is
-    NOT walked into (we stop at the first repo boundary when descending)."""
+    """If root is a repo, nested repos are still discovered as separate roots."""
     (tmp_path / ".git").mkdir()
     deep = tmp_path / "a" / "b" / "nested-repo"
     deep.mkdir(parents=True)
     (deep / ".git").mkdir()
     repos = find_git_repos(tmp_path)
-    # Root IS found; nested still discovered on its own branch (not inside root's .git)
     assert tmp_path in repos
+    assert deep in repos
+
+
+def test_find_git_repos_detects_git_file_markers(tmp_path):
+    (tmp_path / ".git").write_text("gitdir: /tmp/root.git\n")
+    sub = tmp_path / "subproject"
+    sub.mkdir()
+    (sub / ".git").write_text("gitdir: /tmp/sub.git\n")
+    repos = find_git_repos(tmp_path)
+    assert tmp_path in repos
+    assert sub in repos
 
 
 def test_find_git_repos_empty_dir(tmp_path):
@@ -202,20 +216,35 @@ def test_find_git_repos_empty_dir(tmp_path):
 # ── scan ────────────────────────────────────────────────────────────────
 
 
+def _require_git() -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git executable not available")
+
+
+def _git_commit(
+    path: Path, filename: str, content: str, message: str, name: str, email: str
+) -> None:
+    _require_git()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": name,
+        "GIT_AUTHOR_EMAIL": email,
+        "GIT_COMMITTER_NAME": name,
+        "GIT_COMMITTER_EMAIL": email,
+    }
+    (path / filename).write_text(content)
+    subprocess.run(["git", "add", filename], cwd=path, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", message], cwd=path, check=True, env=env)
+
+
 def _init_git_repo(path: Path, name: str = "Jane Doe", email: str = "jane@example.com"):
     """Helper: init a git repo with one commit."""
+    _require_git()
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
     subprocess.run(["git", "config", "user.name", name], cwd=path, check=True)
     subprocess.run(["git", "config", "user.email", email], cwd=path, check=True)
     subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=path, check=True)
-    (path / "README.md").write_text("hello")
-    subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
-    subprocess.run(
-        ["git", "commit", "-q", "-m", "initial"],
-        cwd=path,
-        check=True,
-        env={"GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email, "PATH": "/usr/bin:/bin"},
-    )
+    _git_commit(path, "README.md", "hello", "initial", name, email)
 
 
 def test_scan_project_from_package_json(tmp_path):
@@ -234,6 +263,17 @@ def test_scan_project_from_pyproject(tmp_path):
     assert any(p.name == "pyproj" for p in projects)
 
 
+def test_scan_prefers_root_manifest_with_explicit_priority(tmp_path):
+    (tmp_path / "package.json").write_text(json.dumps({"name": "package-name"}))
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "pyproject-name"\n')
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "package.json").write_text(json.dumps({"name": "nested-name"}))
+    _init_git_repo(tmp_path)
+    projects, _ = scan(tmp_path)
+    assert projects[0].name == "pyproject-name"
+
+
 def test_scan_fallback_to_dir_name_when_no_manifest(tmp_path):
     repo = tmp_path / "my-repo-name"
     repo.mkdir()
@@ -250,6 +290,34 @@ def test_scan_manifest_only_no_git(tmp_path):
     assert projects[0].name == "manifest-only"
     assert projects[0].has_git is False
     assert people == []
+
+
+def test_collect_manifest_names_stops_at_git_file_boundary(tmp_path):
+    (tmp_path / ".git").write_text("gitdir: /tmp/root.git\n")
+    (tmp_path / "package.json").write_text(json.dumps({"name": "root-name"}))
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / ".git").write_text("gitdir: /tmp/nested.git\n")
+    (nested / "package.json").write_text(json.dumps({"name": "nested-name"}))
+    manifests = _collect_manifest_names(tmp_path)
+    assert [name for _file, name, _dir in manifests] == ["root-name"]
+
+
+def test_scan_excludes_bot_commits_from_totals(tmp_path):
+    (tmp_path / "package.json").write_text(json.dumps({"name": "my-app"}))
+    _init_git_repo(tmp_path, name="Jane Doe", email="jane@example.com")
+    _git_commit(
+        tmp_path,
+        "bot.txt",
+        "generated",
+        "bot update",
+        "github-actions[bot]",
+        "41898282+github-actions[bot]@users.noreply.github.com",
+    )
+    projects, people = scan(tmp_path)
+    assert projects[0].total_commits == 1
+    assert projects[0].user_commits == 1
+    assert [person.name for person in people] == ["Jane Doe"]
 
 
 def test_scan_empty_dir(tmp_path):

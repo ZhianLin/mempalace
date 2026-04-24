@@ -170,6 +170,12 @@ MANIFEST_PARSERS = {
     "Cargo.toml": _parse_cargo,
     "go.mod": _parse_gomod,
 }
+MANIFEST_PRIORITY = {
+    "pyproject.toml": 0,
+    "package.json": 1,
+    "Cargo.toml": 2,
+    "go.mod": 3,
+}
 
 
 # ==================== GIT HELPERS ====================
@@ -290,7 +296,6 @@ def _looks_like_real_name(name: str) -> bool:
 def _walk(root: Path, max_depth: int = MAX_DEPTH):
     for dirpath, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
-        rel = Path(dirpath).relative_to(root) if dirpath != str(root) else Path(".")
         try:
             rel = Path(dirpath).relative_to(root)
         except ValueError:
@@ -302,17 +307,34 @@ def _walk(root: Path, max_depth: int = MAX_DEPTH):
         yield Path(dirpath), dirs, files
 
 
+def _has_git_marker(path: Path) -> bool:
+    git_path = path / ".git"
+    return git_path.is_dir() or git_path.is_file()
+
+
+def _manifest_sort_key(entry: tuple[str, str, Path], repo_root: Path) -> tuple[int, int, str]:
+    manifest_file, _project_name, manifest_dir = entry
+    try:
+        rel = manifest_dir.relative_to(repo_root)
+        depth = len(rel.parts)
+        rel_str = rel.as_posix()
+    except ValueError:
+        depth = MAX_DEPTH + 1
+        rel_str = manifest_dir.as_posix()
+    return (depth, MANIFEST_PRIORITY.get(manifest_file, len(MANIFEST_PRIORITY)), rel_str)
+
+
 def find_git_repos(root: Path, max_depth: int = MAX_DEPTH) -> list[Path]:
     """Return git repo roots under `root` (including root itself if it's a repo)."""
     root = root.resolve()
     repos: list[Path] = []
-    if (root / ".git").is_dir():
+    if _has_git_marker(root):
         # Root is a repo — still walk for nested repos (submodules, etc.)
         repos.append(root)
     for dirpath, dirs, _ in _walk(root, max_depth):
         if dirpath == root:
             continue
-        if (dirpath / ".git").is_dir():
+        if _has_git_marker(dirpath):
             repos.append(dirpath)
             dirs.clear()  # don't descend into this repo's contents from here
     return repos
@@ -325,7 +347,7 @@ def _collect_manifest_names(repo_root: Path) -> list[tuple[str, str, Path]]:
     """
     found: list[tuple[str, str, Path]] = []
     for dirpath, dirs, files in _walk(repo_root):
-        if dirpath != repo_root and (dirpath / ".git").is_dir():
+        if dirpath != repo_root and _has_git_marker(dirpath):
             dirs.clear()
             continue
         for fname in files:
@@ -335,7 +357,7 @@ def _collect_manifest_names(repo_root: Path) -> list[tuple[str, str, Path]]:
             name = parser(dirpath / fname)
             if name:
                 found.append((fname, name, dirpath))
-    return found
+    return sorted(found, key=lambda entry: _manifest_sort_key(entry, repo_root))
 
 
 # ==================== MAIN SCAN ====================
@@ -437,21 +459,17 @@ def scan(root: str | os.PathLike) -> tuple[list[ProjectInfo], list[PersonInfo]]:
 
     for repo in repos:
         manifests = _collect_manifest_names(repo)
-        root_level = [m for m in manifests if m[2] == repo]
-        if root_level:
-            manifest_file, proj_name, _ = root_level[0]
-        elif manifests:
+        if manifests:
             manifest_file, proj_name, _ = manifests[0]
         else:
             manifest_file, proj_name = None, repo.name
 
         authors = _git_authors(repo)
-        total_commits = len(authors)
+        non_bot_authors = [(name, email) for name, email in authors if not _is_bot(name, email)]
+        total_commits = len(non_bot_authors)
         user_commits = 0
         author_counts: dict[str, int] = {}
-        for name, email in authors:
-            if _is_bot(name, email):
-                continue
+        for name, email in non_bot_authors:
             author_counts[name] = author_counts.get(name, 0) + 1
             all_commits.append((name, email, str(repo)))
             if (me_name and name == me_name) or (me_email and email == me_email):
